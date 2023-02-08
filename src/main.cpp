@@ -1,3 +1,5 @@
+#include <iostream>
+#include <queue>
 #include <Arduino.h>
 #include <FS.h>
 #include <WiFi.h>
@@ -5,34 +7,30 @@
 #include <ArduinoJson.h>
 #include <Bounce2.h>
 
+using namespace std;
+
 #define BUTTON 27
 #define LDR 34
 #define GREEN 33
 #define YELLOW 25
 #define RED 26
-#define touch1 2
-#define touch2 13
+#define TOUCH_1 2
+#define TOUCH_2 13
 
 const char *ssid = "VjumpKunG";
 const char *password = "Kungjump-1";
 
 Bounce debouncer = Bounce();
 
+queue<int> q;
+
+int threshold = 25;
+const long touchDelay = 1800; // ms
+volatile unsigned long touch[2] = {0, 0};
+
 bool active[3] = {0, 0, 0}; // 0 = off, 1 = on
 int level[3] = {0, 0, 0};   // 0-255
 bool mode[3] = {0, 0, 0};   // 0 = manual, 1 = auto
-
-bool touch[2] = {0, 0};
-int touches[2] = {touch1, touch2};
-
-int threshold = 25;
-bool touch1detected = false;
-bool touch2detected = false;
-const long touchDelay = 1800; // ms
-volatile unsigned long sinceLastTouch1 = 0;
-volatile unsigned long sinceLastTouch2 = 0;
-
-TaskHandle_t POST_StatusHandle;
 
 void Connect_Wifi();
 void Solve(void *param);
@@ -43,25 +41,29 @@ void GET_Level(void *param);
 
 bool touchDelayComp(unsigned long lastTouch)
 {
-  if (millis() - lastTouch < touchDelay)
-    return false;
-  return true;
+  return millis() - lastTouch >= touchDelay;
 }
 
-void touch1detect()
+void touch1Detect()
 {
-  if (touchDelayComp(sinceLastTouch1))
+  if (touchDelayComp(touch[0]))
   {
-    sinceLastTouch1 = millis();
-    touch[0] = true;
+    touch[0] = millis();
+    if (!mode[1])
+    {
+      q.push(1);
+    }
   }
 }
-void touch2detect()
+void touch2Detect()
 {
-  if (touchDelayComp(sinceLastTouch2))
+  if (touchDelayComp(touch[1]))
   {
-    sinceLastTouch2 = millis();
-    touch[1] = true;
+    touch[1] = millis();
+    if (!mode[2])
+    {
+      q.push(2);
+    }
   }
 }
 
@@ -79,23 +81,53 @@ void setup()
   ledcSetup(2, 5000, 8);
   ledcAttachPin(RED, 2);
 
-  touchAttachInterrupt(touch1, touch1detect, threshold);
-  touchAttachInterrupt(touch2, touch2detect, threshold);
+  touchAttachInterrupt(TOUCH_1, touch1Detect, threshold);
+  touchAttachInterrupt(TOUCH_2, touch2Detect, threshold);
 
   Connect_Wifi();
 
-  xTaskCreatePinnedToCore(GET_Status, "GET_Status", 65536, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(Solve, "Solve", 1000, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(GET_Status, "GET_Status", 65536, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(POST_Status, "POST_Status", 20000, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(Solve, "Solve", 1000, NULL, 1, NULL, 0);
 }
 
 void loop()
 {
+  // int l = map(analogRead(LDR), 2100, 3700, 0, 255);
+  // for (int i = 0; i < 3; i++)
+  // {
+  //   if (mode[i])
+  //   {
+  //     if (l < 127)
+  //     {
+  //       ledcWrite(i, level[i]);
+  //     }
+  //     else
+  //     {
+  //       ledcWrite(i, 0);
+  //     }
+  //   }
+  //   else
+  //   {
+  //     if (i == 0)
+  //     {
+  //       debouncer.update();
+  //       if (debouncer.fell() && !mode[i])
+  //       {
+  //         q.push(0);
+  //       }
+  //     }
+
+  //     ledcWrite(i, active[i] ? level[i] : 0);
+  //   }
+  // }
 }
 
 void Solve(void *param)
 {
   while (1)
   {
+    Serial.println("Solve");
     int l = map(analogRead(LDR), 2100, 3700, 0, 255);
     for (int i = 0; i < 3; i++)
     {
@@ -117,19 +149,10 @@ void Solve(void *param)
           debouncer.update();
           if (debouncer.fell() && !mode[i])
           {
-            int j = 0;
-            xTaskCreatePinnedToCore(POST_Status, "POST_Status", 10000, (void *)&j, 2, &POST_StatusHandle, 0);
+            q.push(0);
           }
         }
-        else
-        {
-          if (touch[i - 1] && !mode[i])
-          {
-            int j = i;
-            touch[i - 1] = false;
-            xTaskCreatePinnedToCore(POST_Status, "POST_Status", 10000, (void *)&j, 2, &POST_StatusHandle, 0);
-          }
-        }
+
         ledcWrite(i, active[i] ? level[i] : 0);
       }
     }
@@ -142,34 +165,33 @@ void POST_Status(void *param)
 {
   while (1)
   {
-    // POST to server with room id & status (!active[i])
-    int i = *(int *)param;
-    char buffer[100];
-    sprintf(buffer, "http://192.168.136.167:8000/room/manual/turn_off/%d", i + 1);
-    if (!active[i])
+    Serial.println("POST_Status");
+    while (!q.empty())
     {
-      sprintf(buffer, "http://192.168.136.167:8000/room/manual/turn_on/%d", i + 1);
-    }
-    Serial.println(buffer);
-    String json;
-    HTTPClient http;
-    http.begin(buffer);
-    int httpResponseCode = http.POST(json);
-    if (httpResponseCode == 200)
-    {
-      Serial.println("Done");
-      http.end();
-    }
-    else
-    {
-      http.end();
-      Serial.print("POST Error code: ");
-      Serial.println(httpResponseCode);
-    }
-    // Also delete this task when sucessfully POST to server
-    if (POST_StatusHandle != NULL)
-    {
-      vTaskDelete(POST_StatusHandle);
+      // POST to server with room id & status (!active[i])
+      int i = q.front();
+      char buffer[100];
+      sprintf(buffer, "http://192.168.136.167:8000/room/manual/turn_off/%d", i + 1);
+      if (!active[i])
+      {
+        sprintf(buffer, "http://192.168.136.167:8000/room/manual/turn_on/%d", i + 1);
+      }
+      String json;
+      HTTPClient http;
+      http.begin(buffer);
+      Serial.printf("POST: room: %d, status: %s\n", i + 1, active[i] ? "off" : "on");
+      int httpResponseCode = http.POST(json);
+      if (httpResponseCode == 200)
+      {
+        http.end();
+        Serial.printf("POST Result: room: %d, status: %s\n", i + 1, active[i] ? "off" : "on");
+        q.pop();
+      }
+      else
+      {
+        http.end();
+        Serial.printf("POST Error code: %d\n", httpResponseCode);
+      }
     }
   }
 }
@@ -179,11 +201,11 @@ void GET_Status(void *param)
 {
   while (1)
   {
-    // Don't update active map if mode is auto?
+    Serial.println("GET_Status");
+    //  Don't update active map if mode is auto?
     DynamicJsonDocument doc(65536);
     HTTPClient http;
     http.begin("http://192.168.136.167:8000/room/get_all_bulbs_info/");
-    http.setTimeout(10000);
 
     int httpResponseCode = http.GET();
     if (httpResponseCode == 200)
@@ -200,14 +222,16 @@ void GET_Status(void *param)
       active[2] = rooms["room_3"].as<JsonObject>()["status"].as<bool>();
       level[2] = rooms["room_3"].as<JsonObject>()["brightness"].as<int>();
       mode[2] = rooms["room_3"].as<JsonObject>()["mode"].as<String>() != "manual";
+      Serial.printf("GET Result: room: %d, status: %d, brightness: %d, mode: %s\n", 1, active[0], level[0], mode[0] ? "auto" : "manual");
+      Serial.printf("GET Result: room: %d, status: %d, brightness: %d, mode: %s\n", 2, active[1], level[1], mode[1] ? "auto" : "manual");
+      Serial.printf("GET Result: room: %d, status: %d, brightness: %d, mode: %s\n", 3, active[2], level[2], mode[2] ? "auto" : "manual");
       http.end();
       vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     else
     {
       http.end();
-      Serial.print("GET Error code: ");
-      Serial.println(httpResponseCode);
+      Serial.printf("GET Error code: %d\n", httpResponseCode);
     }
   }
 }
